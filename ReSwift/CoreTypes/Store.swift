@@ -17,17 +17,21 @@ open class Store<State>: StoreType {
 
     typealias SubscriptionType = SubscriptionBox<State>
 
-    private(set) public var state: State! {
-        didSet {
-            subscriptions.forEach {
-                if $0.subscriber == nil {
-                    subscriptions.remove($0)
-                } else {
-                    $0.newValues(oldState: oldValue, newState: state)
-                }
-            }
-        }
-    }
+	private(set) public var state: State! {
+	    didSet {
+	        var staleSubscriptions: [SubscriptionType] = []
+	        for subscription in subscriptions {
+	            if subscription.subscriber == nil {
+	                staleSubscriptions.append(subscription)
+	            } else {
+	                subscription.newValues(oldState: oldValue, newState: state)
+	            }
+	        }
+	        for stale in staleSubscriptions {
+	            subscriptions.remove(stale)
+	        }
+	    }
+	}
 
     public lazy var dispatchFunction: DispatchFunction! = createDispatchFunction()
 
