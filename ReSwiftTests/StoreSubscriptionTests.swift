@@ -102,6 +102,48 @@ class StoreSubscriptionTests: XCTestCase {
     }
 
     /**
+     it lets the teardown of an unsubscribed subscription unsubscribe another subscriber
+     */
+    func testUnsubscribeWhoseTeardownUnsubscribes() {
+        let store = Store(reducer: reducer.handleAction, state: TestAppState())
+        let subscriber = TestSubscriber()
+        let other = TestSubscriber()
+        store.subscribe(other)
+        subscribe(subscriber, to: store, keepingAlive: DeinitObserver { store.unsubscribe(other) })
+
+        // Removing the box releases its selector, and with it the observer that unsubscribes `other`.
+        store.unsubscribe(subscriber)
+
+        XCTAssertEqual(store.subscriptions.count, 0)
+    }
+
+    /**
+     it lets the teardown of a replaced subscription unsubscribe another subscriber
+     */
+    func testResubscribeWhoseTeardownUnsubscribes() {
+        let store = Store(reducer: reducer.handleAction, state: TestAppState())
+        let subscriber = TestSubscriber()
+        let other = TestSubscriber()
+        store.subscribe(other)
+        subscribe(subscriber, to: store, keepingAlive: DeinitObserver { store.unsubscribe(other) })
+
+        // Subscribing again replaces the box, which releases the observer that unsubscribes `other`.
+        store.subscribe(subscriber)
+
+        XCTAssertEqual(store.subscriptions.count, 1)
+    }
+
+    private func subscribe(_ subscriber: TestSubscriber, to store: Store<TestAppState>,
+                           keepingAlive observer: DeinitObserver) {
+        store.subscribe(subscriber) { subscription in
+            subscription.select { state -> TestAppState in
+                withExtendedLifetime(observer) {}
+                return state
+            }
+        }
+    }
+
+    /**
      it replaces the subscription of an existing subscriber with the new one.
      */
     func testDuplicateSubscription() {

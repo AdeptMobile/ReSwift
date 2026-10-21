@@ -34,7 +34,12 @@ open class Store<State>: StoreType {
             if !staleSubscriptions.isEmpty {
                 withSubscriptions { subscriptions in
                     for stale in staleSubscriptions {
-                        subscriptions.remove(stale)
+                        // Boxes are equal when their subscribers had the same address, and a
+                        // new subscriber can reuse a freed one's: only remove the box found stale.
+                        // `staleSubscriptions` keeps it alive until after the lock.
+                        if let index = subscriptions.firstIndex(of: stale), subscriptions[index] === stale {
+                            subscriptions.remove(at: index)
+                        }
                     }
                 }
             }
@@ -50,9 +55,7 @@ open class Store<State>: StoreType {
     /// crash with "unrecognized selector sent to instance 0x8000000000000000".
     var subscriptions: Set<SubscriptionType> = []
 
-    /// Recursive because removing a box can release the last reference to a subscriber's
-    /// selector closures, and that teardown may call `unsubscribe` on the same thread.
-    private let subscriptionsLock = NSRecursiveLock()
+    private let subscriptionsLock = NSLock()
 
     private var isDispatching = Synchronized<Bool>(false)
 
@@ -122,6 +125,7 @@ open class Store<State>: StoreType {
             subscriber: subscriber
         )
 
+        // Returns any box this one replaces, so it is released after the lock.
         withSubscriptions { $0.update(with: subscriptionBox) }
 
         if let state = self.state {
@@ -163,13 +167,20 @@ open class Store<State>: StoreType {
 
     open func unsubscribe(_ subscriber: AnyStoreSubscriber) {
         // Find and remove under one lock, so another thread can't invalidate the index.
-        withSubscriptions { subscriptions in
-            if let index = subscriptions.firstIndex(where: { return $0.subscriber === subscriber }) {
-                subscriptions.remove(at: index)
+        withSubscriptions { subscriptions -> SubscriptionType? in
+            guard let index = subscriptions.firstIndex(where: { $0.subscriber === subscriber }) else {
+                return nil
             }
+            // Returned rather than dropped here; see `withSubscriptions`.
+            return subscriptions.remove(at: index)
         }
     }
 
+    /// Runs `body` with exclusive access to `subscriptions`.
+    ///
+    /// `body` must not drop the last reference to a box: return removed boxes instead, so they are
+    /// released after the lock is unlocked. A box's teardown can call back into the store, which
+    /// would re-enter the lock and the exclusive access to `subscriptions`.
     @discardableResult
     private func withSubscriptions<T>(_ body: (inout Set<SubscriptionType>) -> T) -> T {
         subscriptionsLock.lock()
