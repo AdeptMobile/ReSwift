@@ -6,6 +6,8 @@
 //  Copyright © 2015 ReSwift Community. All rights reserved.
 //
 
+import Foundation
+
 /**
  This class is the default implementation of the `StoreType` protocol. You will use this store in most
  of your applications. You shouldn't need to implement your own store.
@@ -17,27 +19,43 @@ open class Store<State>: StoreType {
 
     typealias SubscriptionType = SubscriptionBox<State>
 
-	private(set) public var state: State! {
-	    didSet {
-	        var staleSubscriptions: [SubscriptionType] = []
-	        for subscription in subscriptions {
-	            if subscription.subscriber == nil {
-	                staleSubscriptions.append(subscription)
-	            } else {
-	                subscription.newValues(oldState: oldValue, newState: state)
-	            }
-	        }
-	        for stale in staleSubscriptions {
-	            subscriptions.remove(stale)
-	        }
-	    }
-	}
+    private(set) public var state: State! {
+        didSet {
+            // Notify from a snapshot and without holding the lock, so subscribers can
+            // subscribe, unsubscribe or dispatch from `newState`.
+            var staleSubscriptions: [SubscriptionType] = []
+            for subscription in withSubscriptions({ $0 }) {
+                if subscription.subscriber == nil {
+                    staleSubscriptions.append(subscription)
+                } else {
+                    subscription.newValues(oldState: oldValue, newState: state)
+                }
+            }
+            if !staleSubscriptions.isEmpty {
+                withSubscriptions { subscriptions in
+                    for stale in staleSubscriptions {
+                        // Boxes are equal when their subscribers had the same address, and a
+                        // new subscriber can reuse a freed one's: only remove the box found stale.
+                        // `staleSubscriptions` keeps it alive until after the lock.
+                        if let index = subscriptions.firstIndex(of: stale), subscriptions[index] === stale {
+                            subscriptions.remove(at: index)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     public lazy var dispatchFunction: DispatchFunction! = createDispatchFunction()
 
     private var reducer: Reducer<State>
 
+    /// Only read or mutate this through `withSubscriptions`. A thread that reads the set while
+    /// another thread mutates it in place can see Swift's temporary placeholder storage and
+    /// crash with "unrecognized selector sent to instance 0x8000000000000000".
     var subscriptions: Set<SubscriptionType> = []
+
+    private let subscriptionsLock = NSLock()
 
     private var isDispatching = Synchronized<Bool>(false)
 
@@ -107,7 +125,8 @@ open class Store<State>: StoreType {
             subscriber: subscriber
         )
 
-        subscriptions.update(with: subscriptionBox)
+        // Returns any box this one replaces, so it is released after the lock.
+        withSubscriptions { $0.update(with: subscriptionBox) }
 
         if let state = self.state {
             originalSubscription.newValues(oldState: nil, newState: state)
@@ -147,15 +166,26 @@ open class Store<State>: StoreType {
     }
 
     open func unsubscribe(_ subscriber: AnyStoreSubscriber) {
-        #if swift(>=5.0)
-        if let index = subscriptions.firstIndex(where: { return $0.subscriber === subscriber }) {
-            subscriptions.remove(at: index)
+        // Find and remove under one lock, so another thread can't invalidate the index.
+        withSubscriptions { subscriptions -> SubscriptionType? in
+            guard let index = subscriptions.firstIndex(where: { $0.subscriber === subscriber }) else {
+                return nil
+            }
+            // Returned rather than dropped here; see `withSubscriptions`.
+            return subscriptions.remove(at: index)
         }
-        #else
-        if let index = subscriptions.index(where: { return $0.subscriber === subscriber }) {
-            subscriptions.remove(at: index)
-        }
-        #endif
+    }
+
+    /// Runs `body` with exclusive access to `subscriptions`.
+    ///
+    /// `body` must not drop the last reference to a box: return removed boxes instead, so they are
+    /// released after the lock is unlocked. A box's teardown can call back into the store, which
+    /// would re-enter the lock and the exclusive access to `subscriptions`.
+    @discardableResult
+    private func withSubscriptions<T>(_ body: (inout Set<SubscriptionType>) -> T) -> T {
+        subscriptionsLock.lock()
+        defer { subscriptionsLock.unlock() }
+        return body(&subscriptions)
     }
 
     // swiftlint:disable:next identifier_name
