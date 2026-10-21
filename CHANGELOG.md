@@ -5,6 +5,7 @@
 **API Changes:**
 
 **Other:**
+- Guard `Store.subscriptions` with a lock so subscribing, unsubscribing or dispatching on another thread can no longer corrupt the set while it is being iterated or mutated
 
 # 6.2.0 
 
